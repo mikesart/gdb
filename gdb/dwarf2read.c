@@ -270,9 +270,6 @@ struct mapped_index_base
      yet.  */
   void build_name_components ();
 
-  /* Build name component mutex */
-  std::mutex *name_components_mutex = nullptr;
-
   /* Returns the lower (inclusive) and upper (exclusive) bounds of the
      possible matches for LN_NO_PARAMS in the name component
      vector.  */
@@ -494,9 +491,6 @@ public:
 
   /* The mapped index, or NULL if .debug_names is missing or not being used.  */
   std::unique_ptr<mapped_debug_names> debug_names_table;
-
-  /* Mutex for calling build_name_components() with above mapped_index or mapped_debug_names */
-  std::unique_ptr<std::mutex> mapped_index_mutex;
 
   std::future<void> build_name_components_result;
 
@@ -2402,7 +2396,7 @@ dwarf2_per_objfile::dwarf2_per_objfile (struct objfile *objfile_,
 dwarf2_per_objfile::~dwarf2_per_objfile ()
 {
   if (build_name_components_result.valid())
-    build_name_components_result.wait();
+    build_name_components_result.get();
 
   /* Cached DIE trees use xmalloc and the comp_unit_obstack.  */
   free_cached_comp_units ();
@@ -4727,7 +4721,6 @@ mapped_index_base::find_name_components_bounds
 void
 mapped_index_base::build_name_components ()
 {
-  std::unique_lock< std::mutex > lock( *this->name_components_mutex );
 
   if (!this->name_components.empty ())
     return;
@@ -4806,7 +4799,10 @@ dw2_expand_symtabs_matching_symbol
 
   /* Build the symbol name component sorted vector, if we haven't
      yet.  */
-  index.build_name_components ();
+  if ( dwarf2_per_objfile->build_name_components_result.valid() )
+      dwarf2_per_objfile->build_name_components_result.get();
+  else
+      index.build_name_components ();
 
   auto bounds = index.find_name_components_bounds (lookup_name_without_params);
 
@@ -5026,10 +5022,8 @@ check_find_bounds_finds (mapped_index_base &index,
 static void
 test_mapped_index_find_name_component_bounds ()
 {
-  std::mutex mutex;
   mock_mapped_index mock_index (test_symbols);
 
-  mock_index.name_components_mutex = &mutex;
   mock_index.build_name_components ();
 
   /* Test the lower-level mapped_index::find_name_component_bounds
@@ -6533,9 +6527,6 @@ dwarf2_initialize_objfile (struct objfile *objfile, dw_index_kind *index_kind)
 
   if ( index_base )
     {
-      index_base->name_components_mutex = new std::mutex;
-      dwarf2_per_objfile->mapped_index_mutex.reset (index_base->name_components_mutex);
-
       dwarf2_per_objfile->build_name_components_result = g_threadpool.submit_job(
                   "build_name_components", [=]{ index_base->build_name_components (); } );
 
