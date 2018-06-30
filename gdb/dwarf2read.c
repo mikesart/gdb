@@ -88,6 +88,12 @@
 #include <forward_list>
 #include "common/pathstuff.h"
 
+#include "threadpool.h"
+
+#include "../../gpuvis_trace_utils.h"
+
+static ThreadPool g_threadpool;
+
 typedef struct symbol *symbolp;
 DEF_VEC_P (symbolp);
 
@@ -263,6 +269,9 @@ struct mapped_index_base
   /* Build the symbol name component sorted vector, if we haven't
      yet.  */
   void build_name_components ();
+
+  /* Build name component mutex */
+  std::mutex *name_components_mutex = nullptr;
 
   /* Returns the lower (inclusive) and upper (exclusive) bounds of the
      possible matches for LN_NO_PARAMS in the name component
@@ -485,6 +494,11 @@ public:
 
   /* The mapped index, or NULL if .debug_names is missing or not being used.  */
   std::unique_ptr<mapped_debug_names> debug_names_table;
+
+  /* Mutex for calling build_name_components() with above mapped_index or mapped_debug_names */
+  std::unique_ptr<std::mutex> mapped_index_mutex;
+
+  std::future<void> build_name_components_result;
 
   /* When using index_table, this keeps track of all quick_file_names entries.
      TUs typically share line table entries with a CU, so we maintain a
@@ -2387,6 +2401,9 @@ dwarf2_per_objfile::dwarf2_per_objfile (struct objfile *objfile_,
 
 dwarf2_per_objfile::~dwarf2_per_objfile ()
 {
+  if (build_name_components_result.valid())
+    build_name_components_result.wait();
+
   /* Cached DIE trees use xmalloc and the comp_unit_obstack.  */
   free_cached_comp_units ();
 
@@ -4710,6 +4727,8 @@ mapped_index_base::find_name_components_bounds
 void
 mapped_index_base::build_name_components ()
 {
+  std::unique_lock< std::mutex > lock( *this->name_components_mutex );
+
   if (!this->name_components.empty ())
     return;
 
@@ -5007,8 +5026,10 @@ check_find_bounds_finds (mapped_index_base &index,
 static void
 test_mapped_index_find_name_component_bounds ()
 {
+  std::mutex mutex;
   mock_mapped_index mock_index (test_symbols);
 
+  mock_index.name_components_mutex = &mutex;
   mock_index.build_name_components ();
 
   /* Test the lower-level mapped_index::find_name_component_bounds
@@ -6497,15 +6518,27 @@ dwarf2_initialize_objfile (struct objfile *objfile, dw_index_kind *index_kind)
       return true;
     }
 
+  mapped_index_base *index_base = nullptr;
+
   if (dwarf2_read_debug_names (objfile))
     {
       *index_kind = dw_index_kind::DEBUG_NAMES;
-      return true;
+      index_base = dwarf2_per_objfile->debug_names_table.get();
     }
-
-  if (dwarf2_read_index (objfile))
+  else if (dwarf2_read_index (objfile))
     {
       *index_kind = dw_index_kind::GDB_INDEX;
+      index_base = dwarf2_per_objfile->index_table;
+    }
+
+  if ( index_base )
+    {
+      index_base->name_components_mutex = new std::mutex;
+      dwarf2_per_objfile->mapped_index_mutex.reset (index_base->name_components_mutex);
+
+      dwarf2_per_objfile->build_name_components_result = g_threadpool.submit_job(
+                  "build_name_components", [=]{ index_base->build_name_components (); } );
+
       return true;
     }
 
