@@ -88,6 +88,10 @@
 #include <forward_list>
 #include "common/pathstuff.h"
 
+#include "threadpool.h"
+
+static ThreadPool g_threadpool( ThreadPool::get_num_supported_hw_threads(), 8 );
+
 typedef struct symbol *symbolp;
 DEF_VEC_P (symbolp);
 
@@ -235,6 +239,17 @@ struct name_component
   offset_type idx;
 };
 
+//$ TODO: False sharing an issue? Maybe should be 64b?
+struct name_component_block
+{
+    offset_type idx_start;
+    offset_type idx_end;
+
+    std::future<void> *result;
+
+    std::vector<name_component> name_components;
+};
+
 /* Base class containing bits shared by both .gdb_index and
    .debug_name indexes.  */
 
@@ -242,7 +257,7 @@ struct mapped_index_base
 {
   /* The name_component table (a sorted vector).  See name_component's
      description above.  */
-  std::vector<name_component> name_components;
+  std::vector<name_component_block> name_component_blocks;
 
   /* How NAME_COMPONENTS is sorted.  */
   enum case_sensitivity name_components_casing;
@@ -262,18 +277,24 @@ struct mapped_index_base
 
   /* Build the symbol name component sorted vector, if we haven't
      yet.  */
-  void build_name_components ();
+  void build_name_components (bool threaded);
+  void build_name_components_block (name_component_block *block);
+  static const size_t block_size = 64 * 1024;
 
   /* Returns the lower (inclusive) and upper (exclusive) bounds of the
      possible matches for LN_NO_PARAMS in the name component
      vector.  */
   std::pair<std::vector<name_component>::const_iterator,
 	    std::vector<name_component>::const_iterator>
-    find_name_components_bounds (const lookup_name_info &ln_no_params) const;
+    find_name_components_bounds (size_t block, const lookup_name_info &ln_no_params) const;
 
   /* Prevent deleting/destroying via a base class pointer.  */
 protected:
-  ~mapped_index_base() = default;
+  ~mapped_index_base()
+  {
+      for ( name_component_block &block : name_component_blocks )
+          delete block.result;
+  }
 };
 
 /* A description of the mapped index.  The file format is described in
@@ -485,6 +506,8 @@ public:
 
   /* The mapped index, or NULL if .debug_names is missing or not being used.  */
   std::unique_ptr<mapped_debug_names> debug_names_table;
+
+  std::future<void> build_name_components_result;
 
   /* When using index_table, this keeps track of all quick_file_names entries.
      TUs typically share line table entries with a CU, so we maintain a
@@ -2387,6 +2410,9 @@ dwarf2_per_objfile::dwarf2_per_objfile (struct objfile *objfile_,
 
 dwarf2_per_objfile::~dwarf2_per_objfile ()
 {
+  if (build_name_components_result.valid())
+    build_name_components_result.get();
+
   /* Cached DIE trees use xmalloc and the comp_unit_obstack.  */
   free_cached_comp_units ();
 
@@ -4636,7 +4662,7 @@ make_sort_after_prefix_name (const char *search_name)
 std::pair<std::vector<name_component>::const_iterator,
 	  std::vector<name_component>::const_iterator>
 mapped_index_base::find_name_components_bounds
-  (const lookup_name_info &lookup_name_without_params) const
+  (size_t block, const lookup_name_info &lookup_name_without_params) const
 {
   auto *name_cmp
     = this->name_components_casing == case_sensitive_on ? strcmp : strcasecmp;
@@ -4664,8 +4690,14 @@ mapped_index_base::find_name_components_bounds
       return name_cmp (name, elem_name) < 0;
     };
 
-  auto begin = this->name_components.begin ();
-  auto end = this->name_components.end ();
+  if ( this->name_component_blocks[ block ].result &&
+       this->name_component_blocks[ block ].result->valid() )
+    {
+      this->name_component_blocks[ block ].result->get();
+    }
+
+  auto begin = this->name_component_blocks[ block ].name_components.begin ();
+  auto end = this->name_component_blocks[ block ].name_components.end ();
 
   /* Find the lower bound.  */
   auto lower = [&] ()
@@ -4708,15 +4740,8 @@ mapped_index_base::find_name_components_bounds
 /* See declaration.  */
 
 void
-mapped_index_base::build_name_components ()
+mapped_index_base::build_name_components_block(name_component_block *block)
 {
-  if (!this->name_components.empty ())
-    return;
-
-  this->name_components_casing = case_sensitivity;
-  auto *name_cmp
-    = this->name_components_casing == case_sensitive_on ? strcmp : strcasecmp;
-
   /* The code below only knows how to break apart components of C++
      symbol names (and other languages that use '::' as
      namespace/module separator).  If we add support for wild matching
@@ -4724,32 +4749,41 @@ mapped_index_base::build_name_components ()
      D use '.'), then we'll need to try splitting the symbol name
      according to that language too.  Note that Ada does support wild
      matching, but doesn't currently support .gdb_index.  */
-  auto count = this->symbol_name_count ();
-  for (offset_type idx = 0; idx < count; idx++)
+ 
+  auto *name_cmp
+    = this->name_components_casing == case_sensitive_on ? strcmp : strcasecmp;
+
+  for (offset_type idx = block->idx_start; idx < block->idx_end; idx++)
     {
       if (this->symbol_name_slot_invalid (idx))
 	continue;
 
       const char *name = this->symbol_name_at (idx);
 
+      if (!name[0] || (!name[1] && ((unsigned char)name[0] < 32)))
+        continue;
+
       /* Add each name component to the name component table.  */
       unsigned int previous_len = 0;
+
       for (unsigned int current_len = cp_find_first_component (name);
 	   name[current_len] != '\0';
 	   current_len += cp_find_first_component (name + current_len))
 	{
 	  gdb_assert (name[current_len] == ':');
-	  this->name_components.push_back ({previous_len, idx});
+	  block->name_components.push_back ({previous_len, idx});
+
 	  /* Skip the '::'.  */
 	  current_len += 2;
 	  previous_len = current_len;
 	}
-      this->name_components.push_back ({previous_len, idx});
+
+      block->name_components.push_back ({previous_len, idx});
     }
 
   /* Sort name_components elements by name.  */
   auto name_comp_compare = [&] (const name_component &left,
-				const name_component &right)
+				 const name_component &right)
     {
       const char *left_qualified = this->symbol_name_at (left.idx);
       const char *right_qualified = this->symbol_name_at (right.idx);
@@ -4760,9 +4794,46 @@ mapped_index_base::build_name_components ()
       return name_cmp (left_name, right_name) < 0;
     };
 
-  std::sort (this->name_components.begin (),
-	     this->name_components.end (),
+  std::sort (block->name_components.begin (),
+	     block->name_components.end (),
 	     name_comp_compare);
+}
+
+void
+mapped_index_base::build_name_components (bool threaded)
+{
+  if (!this->name_component_blocks.empty ())
+    return;
+
+  this->name_components_casing = case_sensitivity;
+
+  auto count = this->symbol_name_count ();
+
+  if ( threaded )
+  {
+      this->name_component_blocks.resize( ( count + block_size - 1 ) / block_size );
+
+      for ( size_t i = 0; i < name_component_blocks.size(); i++ )
+      {
+          name_component_block *block = &name_component_blocks[ i ];
+
+          block->idx_start = i * block_size;
+          block->idx_end = std::min< offset_type >( block->idx_start + block_size, count );
+
+          block->result = new (std::future<void>);
+          *block->result = g_threadpool.submit_job(
+              "build_name_components", [=]{ build_name_components_block( block ); } );
+      }
+  }
+  else
+  {
+      this->name_component_blocks.resize( 1 );
+
+      name_component_blocks[ 0 ].idx_start = 0;
+      name_component_blocks[ 0 ].idx_end = count;
+      name_component_blocks[ 0 ].result = NULL;
+      build_name_components_block( &name_component_blocks[ 0 ] );
+  }
 }
 
 /* Helper for dw2_expand_symtabs_matching that works with a
@@ -4787,33 +4858,38 @@ dw2_expand_symtabs_matching_symbol
 
   /* Build the symbol name component sorted vector, if we haven't
      yet.  */
-  index.build_name_components ();
+  if ( dwarf2_per_objfile->build_name_components_result.valid() )
+      dwarf2_per_objfile->build_name_components_result.get();
+  else
+      index.build_name_components (true);
 
-  auto bounds = index.find_name_components_bounds (lookup_name_without_params);
-
-  /* Now for each symbol name in range, check to see if we have a name
-     match, and if so, call the MATCH_CALLBACK callback.  */
-
-  /* The same symbol may appear more than once in the range though.
-     E.g., if we're looking for symbols that complete "w", and we have
-     a symbol named "w1::w2", we'll find the two name components for
-     that same symbol in the range.  To be sure we only call the
-     callback once per symbol, we first collect the symbol name
-     indexes that matched in a temporary vector and ignore
-     duplicates.  */
   std::vector<offset_type> matches;
-  matches.reserve (std::distance (bounds.first, bounds.second));
 
-  for (; bounds.first != bounds.second; ++bounds.first)
-    {
-      const char *qualified = index.symbol_name_at (bounds.first->idx);
+  for ( size_t block = 0; block < index.name_component_blocks.size(); block++ )
+  {
+    auto bounds = index.find_name_components_bounds (block, lookup_name_without_params);
 
-      if (!lookup_name_matcher.matches (qualified)
-	  || (symbol_matcher != NULL && !symbol_matcher (qualified)))
-	continue;
+    /* Now for each symbol name in range, check to see if we have a name
+       match, and if so, call the MATCH_CALLBACK callback.  */
 
-      matches.push_back (bounds.first->idx);
-    }
+    /* The same symbol may appear more than once in the range though.
+       E.g., if we're looking for symbols that complete "w", and we have
+       a symbol named "w1::w2", we'll find the two name components for
+       that same symbol in the range.  To be sure we only call the
+       callback once per symbol, we first collect the symbol name
+       indexes that matched in a temporary vector and ignore
+       duplicates.  */
+    for (; bounds.first != bounds.second; ++bounds.first)
+      {
+        const char *qualified = index.symbol_name_at (bounds.first->idx);
+
+        if (!lookup_name_matcher.matches (qualified)
+            || (symbol_matcher != NULL && !symbol_matcher (qualified)))
+          continue;
+
+        matches.push_back (bounds.first->idx);
+      }
+  }
 
   std::sort (matches.begin (), matches.end ());
 
@@ -4984,7 +5060,7 @@ check_find_bounds_finds (mapped_index_base &index,
   lookup_name_info lookup_name (search_name,
 				symbol_name_match_type::FULL, true);
 
-  auto bounds = index.find_name_components_bounds (lookup_name);
+  auto bounds = index.find_name_components_bounds (0, lookup_name);
 
   size_t distance = std::distance (bounds.first, bounds.second);
   if (distance != expected_syms.size ())
@@ -5009,7 +5085,7 @@ test_mapped_index_find_name_component_bounds ()
 {
   mock_mapped_index mock_index (test_symbols);
 
-  mock_index.build_name_components ();
+  mock_index.build_name_components (false);
 
   /* Test the lower-level mapped_index::find_name_component_bounds
      method in completion mode.  */
@@ -6497,15 +6573,27 @@ dwarf2_initialize_objfile (struct objfile *objfile, dw_index_kind *index_kind)
       return true;
     }
 
+  mapped_index_base *index_base = nullptr;
+
   if (dwarf2_read_debug_names (objfile))
     {
       *index_kind = dw_index_kind::DEBUG_NAMES;
-      return true;
+      index_base = dwarf2_per_objfile->debug_names_table.get();
     }
-
-  if (dwarf2_read_index (objfile))
+  else if (dwarf2_read_index (objfile))
     {
       *index_kind = dw_index_kind::GDB_INDEX;
+      index_base = dwarf2_per_objfile->index_table;
+    }
+
+  if ( index_base )
+    {
+      if ( index_base->symbol_name_count() < mapped_index_base::block_size )
+        {
+          dwarf2_per_objfile->build_name_components_result = g_threadpool.submit_job(
+                      "build_name_components", [=]{ index_base->build_name_components (false); } );
+        }
+
       return true;
     }
 
